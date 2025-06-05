@@ -1,0 +1,73 @@
+import pybullet as p
+import pybullet_data
+import time
+import math
+
+# Connect to PyBullet GUI
+physicsClient = p.connect(p.GUI)
+
+# Set up environment
+p.setAdditionalSearchPath(pybullet_data.getDataPath())
+p.setGravity(0, 0, -9.81)
+
+# Load plane and robot
+planeId = p.loadURDF("plane.urdf")
+robotId = p.loadURDF("kuka_iiwa/model.urdf", useFixedBase=True)
+
+# Load object to pick (a cube)
+cubeStartPos = [0.6, 0, 0.05]
+cubeId = p.loadURDF("cube_small.urdf", cubeStartPos, p.getQuaternionFromEuler([0, 0, 0]))
+
+# Joint indices for KUKA (7 DOF arm)
+num_joints = p.getNumJoints(robotId)
+end_effector_index = 6  # 6th joint is end-effector
+gripper_joint_index = 7  # Not used here, but for completeness
+
+# Target positions
+pickup_pos = [0.6, 0, 0.1]
+place_pos = [0.4, -0.2, 0.1]
+
+def move_arm_to(target_pos, target_orn=None):
+    if target_orn is None:
+        target_orn = p.getQuaternionFromEuler([0, math.pi, 0])
+    joint_positions = p.calculateInverseKinematics(robotId, end_effector_index, target_pos, target_orn)
+    for i in range(end_effector_index + 1):  # Only move first 7 joints
+        p.setJointMotorControl2(robotId, i, p.POSITION_CONTROL, joint_positions[i], force=500)
+
+# Simulation loop
+for _ in range(100):
+    move_arm_to(pickup_pos)
+    p.stepSimulation()
+    time.sleep(1/240)
+
+# Attach cube by changing its position to follow the end effector (simple simulation of gripping)
+cube_constraint = p.createConstraint(
+    parentBodyUniqueId=robotId,
+    parentLinkIndex=end_effector_index,
+    childBodyUniqueId=cubeId,
+    childLinkIndex=-1,
+    jointType=p.JOINT_FIXED,
+    jointAxis=[0, 0, 0],
+    parentFramePosition=[0, 0, 0],
+    childFramePosition=[0, 0, 0]
+)
+
+# Move to place position
+for _ in range(100):
+    move_arm_to(place_pos)
+    p.stepSimulation()
+    time.sleep(1/240)
+
+# Detach cube
+p.removeConstraint(cube_constraint)
+
+# Move arm back
+for _ in range(100):
+    move_arm_to([0.5, 0, 0.3])
+    p.stepSimulation()
+    time.sleep(1/240)
+
+# Keep simulation running
+while True:
+    p.stepSimulation()
+    time.sleep(1/240)
