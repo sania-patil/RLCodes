@@ -1,0 +1,223 @@
+# pick_place_env.py
+
+import gymnasium as gym
+import pybullet as p
+import pybullet_data
+import numpy as np
+import time
+import cv2
+from gymnasium import spaces
+from cv2 import aruco
+
+class PickPlaceEnv(gym.Env):
+    def __init__(self, render=False):
+        super(PickPlaceEnv, self).__init__()
+
+        self.render = render
+        self.time_step = 1. / 60.
+        self.max_force = 50
+        self.num_joints = 6
+        self.gripper_link_index = 5
+        self.arm_joint_indices = list(range(5))
+        self.gripper_joint_index = 5
+
+        self.action_space = spaces.Box(low=-1, high=1, shape=(6,), dtype=np.float32)
+
+        # Observation: joint angles (6) + marker x, y (2) = 8
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32)
+
+         # ✅ Camera intrinsics
+        self.camera_matrix = np.array([
+            [320, 0, 320],
+            [0, 320, 240],
+            [0,   0,   1]
+        ], dtype=np.float32)
+        self.dist_coeffs = np.zeros((5, 1), dtype=np.float32)
+
+        self._connect()
+        self.robot_id = None
+        self.cube_id = None
+        self.reset()
+
+    def _connect(self):
+        if self.render:
+            p.connect(p.GUI)
+        else:
+            p.connect(p.DIRECT)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.setTimeStep(self.time_step)
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        p.resetSimulation()
+        p.setGravity(0, 0, -9.81)
+        p.loadURDF("plane.urdf")
+
+        self.robot_id = p.loadURDF("so100.urdf", useFixedBase=True)
+        self.arm_joint_indices = [0, 1, 2, 3, 4]
+        self.gripper_joint_index = 5
+
+        # Fixed cube position in front of gripper
+        cube_x = np.random.uniform(0.12, 0.18)  # In front along X
+        cube_y = np.random.uniform(-0.05, 0.05) # Slight variation left/right
+        cube_z = 0.02
+        self.cube_id = p.loadURDF("cube_small.urdf", [cube_x, cube_y, cube_z])
+
+        self.step_counter = 0
+        return self._get_obs(), {}
+
+    def step(self, action):
+        self.step_counter += 1
+
+        for i, joint_index in enumerate(self.arm_joint_indices):
+            current_pos = p.getJointState(self.robot_id, joint_index)[0]
+            delta = 0.5 * action[i]
+            joint_min, joint_max = [-3.14]*6, [3.14]*6
+            new_target = np.clip(current_pos + delta, joint_min[i], joint_max[i])
+            p.setJointMotorControl2(self.robot_id, joint_index, p.POSITION_CONTROL,
+                                    targetPosition=new_target, force=self.max_force)
+
+        grip_delta = 0.05 * np.clip(action[-1], -1, 1)
+        current_grip = p.getJointState(self.robot_id, self.gripper_joint_index)[0]
+        new_grip = np.clip(current_grip + grip_delta, -0.2, 2.0)
+        p.setJointMotorControl2(self.robot_id, self.gripper_joint_index, p.POSITION_CONTROL,
+                                targetPosition=new_grip, force=20)
+
+        contacts = p.getContactPoints(bodyA=self.robot_id, bodyB=self.cube_id, linkIndexA=self.gripper_link_index)
+
+        if contacts and not hasattr(self, "grasp_constraint"):
+            self.grasp_constraint = p.createConstraint(
+                parentBodyUniqueId=self.robot_id,
+                parentLinkIndex=self.gripper_link_index,
+                childBodyUniqueId=self.cube_id,
+                childLinkIndex=-1,
+                jointType=p.JOINT_FIXED,
+                jointAxis=[0, 0, 0],
+                parentFramePosition=[0, 0, 0],
+                childFramePosition=[0, 0, 0]
+            )
+
+        for _ in range(5):
+            p.stepSimulation()
+            if self.render:
+                time.sleep(self.time_step)
+
+        obs = self._get_obs()
+        reward, done = self._compute_reward()
+        return obs, reward, done, False, {}
+
+    def _get_obs(self):
+        joint_positions = [p.getJointState(self.robot_id, i)[0] for i in self.arm_joint_indices]
+
+        cube_pos = self.detect_aruco_marker()
+        gripper_pos = p.getLinkState(self.robot_id, self.gripper_link_index)[0]
+
+        obs = np.concatenate([
+            joint_positions,
+            cube_pos,
+            gripper_pos
+        ]).astype(np.float32)
+
+
+        print("DEBUG >>> joint_positions:", len(joint_positions))
+        print("DEBUG >>> cube_pos:", cube_pos)
+        print("DEBUG >>> gripper_pos:", gripper_pos)
+        print("DEBUG >>> obs shape:", obs.shape)
+        
+        return obs
+
+
+
+    def detect_aruco_marker(self):
+        width, height = 640, 480
+        view_matrix = p.computeViewMatrixFromYawPitchRoll(
+            cameraTargetPosition=[0.1, 0, 0.1],
+            distance=0.5,
+            yaw=90,
+            pitch=-40,
+            roll=0,
+            upAxisIndex=2
+        )
+        proj_matrix = p.computeProjectionMatrixFOV(
+            fov=60, aspect=float(width) / height, nearVal=0.1, farVal=3.1
+        )
+
+        result = p.getCameraImage(width, height, view_matrix, proj_matrix, renderer=p.ER_BULLET_HARDWARE_OPENGL)
+        rgb_array = np.reshape(result[2], (height, width, 4))[:, :, :3]
+        gray = cv2.cvtColor(rgb_array.astype(np.uint8), cv2.COLOR_BGR2GRAY)
+
+        # ArUco detection
+        aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+        parameters = aruco.DetectorParameters()
+        detector = aruco.ArucoDetector(aruco_dict, parameters)
+        corners, ids, _ = detector.detectMarkers(gray)
+
+        if ids is not None:
+            markerLength = 0.04  # meters
+            success, rvecs, tvecs = cv2.aruco.estimatePoseSingleMarkers(
+                corners, markerLength, self.camera_matrix, self.dist_coeffs
+            )
+            marker_pos_cam = tvecs[0][0]  # Position in camera frame
+
+            # 🔁 Manually compute camera transform
+            cam_target = [0.1, 0, 0.1]
+            cam_distance = 0.5
+            cam_yaw = 90
+            cam_pitch = -40
+            cam_roll = 0
+
+            # Convert angles to radians
+            pitch = np.radians(cam_pitch)
+            yaw = np.radians(cam_yaw)
+            roll = np.radians(cam_roll)
+
+            # Compute rotation matrix using intrinsic rotations: R = Rz(yaw) * Ry(pitch) * Rx(roll)
+            Rx = np.array([
+                [1, 0, 0],
+                [0, np.cos(pitch), -np.sin(pitch)],
+                [0, np.sin(pitch),  np.cos(pitch)]
+            ])
+            Ry = np.array([
+                [np.cos(yaw), 0, np.sin(yaw)],
+                [0, 1, 0],
+                [-np.sin(yaw), 0, np.cos(yaw)]
+            ])
+            Rz = np.array([
+                [np.cos(roll), -np.sin(roll), 0],
+                [np.sin(roll),  np.cos(roll), 0],
+                [0, 0, 1]
+            ])
+            R_cam = Rz @ Ry @ Rx
+
+            # Camera is behind the target at 'distance' along -Z
+            cam_forward = R_cam @ np.array([0, 0, 1])
+            cam_pos = np.array(cam_target) - cam_distance * cam_forward
+
+            # Convert marker pose from camera to world
+            marker_world = R_cam @ marker_pos_cam + cam_pos
+
+            # ✅ Debug line to visualize marker location
+            p.addUserDebugLine(marker_world, marker_world + [0, 0, 0.1], [0, 1, 0], 2, lifeTime=1)
+            print("Detected ArUco marker world position:", marker_world)
+
+            return marker_world
+
+        return np.array([0.0, 0.0, 0.0])
+
+    def _compute_reward(self):
+        gripper_pos = np.array(p.getLinkState(self.robot_id, self.gripper_link_index)[0])
+        cube_pos = np.array(p.getBasePositionAndOrientation(self.cube_id)[0])
+        distance = np.linalg.norm(gripper_pos - cube_pos)
+        contact = len(p.getContactPoints(self.robot_id, self.cube_id)) > 0
+
+        reward = -distance
+        if contact:
+            reward += 5
+        if cube_pos[2] > 0.05:
+            reward += 20
+            return reward, True
+
+        return float(reward), False
+
+    def close(self):
+        p.disconnect()
